@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import sqlite3
 from time import sleep
 import jwt
 import requests
@@ -17,6 +18,55 @@ BSKY_API_BASE = os.getenv('BSKY_API_BASE')
 # Global variables
 access_token = None
 token_expiry = None  # Tracks the expiry of the current access token
+
+
+def initialize_db():
+    """Create SQLite database and table if not exists"""
+    conn = sqlite3.connect('bluesky_replies.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS reply_log (
+            repo TEXT PRIMARY KEY,
+            last_reply_timestamp DATETIME
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def update_reply_log(repo):
+    """Update or insert reply timestamp for a repo"""
+    conn = sqlite3.connect('bluesky_replies.db')
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT OR REPLACE INTO reply_log (repo, last_reply_timestamp) 
+        VALUES (?, ?)
+    ''', (repo, datetime.now().isoformat()))
+
+    conn.commit()
+    conn.close()
+
+def should_send_reply(repo):
+    """Check if a reply can be sent based on last reply timestamp"""
+    conn = sqlite3.connect('bluesky_replies.db')
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT last_reply_timestamp FROM reply_log WHERE repo = ?', (repo,))
+    result = cursor.fetchone()
+
+    current_time = datetime.now()
+    can_reply = False
+
+    if result is None:
+        # No previous reply for this repo
+        can_reply = True
+    else:
+        last_reply_time = datetime.fromisoformat(result[0])
+        if current_time - last_reply_time > timedelta(days=7):
+            can_reply = True
+
+    conn.close()
+    return can_reply
 
 
 def get_access_token(handle, app_password):
@@ -106,7 +156,7 @@ def create_reply(handle, post_uri, post_cid):
                 "features": [
                     {
                         "$type": "app.bsky.richtext.facet#link",
-                        "uri": "https://support.microsoft.com/en-us/office/everything-you-need-to-know-to-write-effective-alt-text-df98f884-ca3d-456c-807b-1a1fa82f5dc2"
+                        "uri": "https://later.com/blog/alt-text/"
                     }
                 ]
             }
@@ -185,19 +235,19 @@ def on_message_handler(message) -> None:
                                 if image.get('alt') == '':
                                     post_cid = op.cid
                                     post_uri = f"at://{commit.repo}/{op.path}"
-                                    print(post_cid)
-                                    print(post_uri)
-                                    tell_off(post_uri, post_cid)
+                                    tell_off(post_uri, post_cid, commit.repo)
 
             except Exception as e:
                 print(f"Error processing message: {e}")
 
 
-def tell_off(post_uri, post_cid):
+def tell_off(post_uri, post_cid, repo):
     """Send a reply to a post without alt text"""
     try:
-        reply = create_reply(BLUESKY_HANDLE, post_uri, post_cid)
-        print(f"Replied to post without alt text. Reply CID: {reply.get('cid')}")
+        if should_send_reply(repo):
+            reply = create_reply(BLUESKY_HANDLE, post_uri, post_cid)
+            # Update the reply log after successful reply
+            update_reply_log(repo)
     except Exception as e:
         print(f"Error replying to post: {e}")
 
@@ -207,8 +257,15 @@ def on_error_handler(error):
 
 
 def main():
-    # Start the firehose client
-    client.start(on_message_handler)
+
+    initialize_db()
+    while True:
+        try:
+            # Start the firehose client
+            client.start(on_message_handler)
+        except Exception as e:
+            print(f"Error replying to post: {e}")
+        sleep(10)   # Give us 10 seconds for whatever happened to pass.
 
 
 if __name__ == "__main__":
